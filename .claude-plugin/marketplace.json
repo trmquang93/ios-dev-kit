@@ -5,14 +5,14 @@
     "email": "trmquang3103@gmail.com"
   },
   "metadata": {
-    "description": "Marketplace for ios-dev-kit — HTML mobile mockups (iOS + Android) + iOS icon export.",
-    "version": "0.3.0"
+    "description": "Marketplace for ios-dev-kit — iOS development skills for SwiftUI, Xcode build/test, localization, debugging, and simulator automation.",
+    "version": "0.4.0"
   },
   "plugins": [
     {
       "name": "ios-dev-kit",
       "source": "./",
-      "category": "design"
+      "category": "development"
     }
   ]
 }
