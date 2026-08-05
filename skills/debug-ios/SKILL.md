@@ -50,10 +50,7 @@ See [references/layout-debug-pattern.md](references/layout-debug-pattern.md) for
 
 ### B4. Build + reproduce
 
-```bash
-cd /path/to/project
-~/.cursor/plugins/cache/ios-dev-kit-marketplace/ios-dev-kit/6b2377b6c703a102bf3ba4f2e16165075b2a8216/skills/ios-build-test/scripts/build.sh --scheme "<scheme>"
-```
+Build the project before reproducing.
 
 **Agent repro (preferred when user says "run it yourself"):**
 

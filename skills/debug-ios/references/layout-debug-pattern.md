@@ -139,12 +139,7 @@ For jumping elements, always log:
 
 ### Build (mandatory)
 
-```bash
-cd /path/to/project
-~/.cursor/plugins/cache/ios-dev-kit-marketplace/ios-dev-kit/6b2377b6c703a102bf3ba4f2e16165075b2a8216/skills/ios-build-test/scripts/build.sh --scheme "<scheme>"
-```
-
-Never run raw `xcodebuild`. Never pipe build output.
+Build the project before reproducing.
 
 ### Reproduce — agent-device (agent can run end-to-end)
 
