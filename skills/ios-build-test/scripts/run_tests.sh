@@ -79,38 +79,10 @@ else
     fi
 fi
 
-pick_available_iphone() {
-    xcrun simctl list devices available -j | python3 -c "
-import sys, json
-devices = json.load(sys.stdin)['devices']
-booted = None
-fallback = None
-for runtime, device_list in devices.items():
-    if 'iOS' not in runtime:
-        continue
-    for device in device_list:
-        if 'iPhone' not in device.get('name', '') or not device.get('isAvailable', False):
-            continue
-        if device.get('state') == 'Booted' and booted is None:
-            booted = device['udid']
-        if fallback is None:
-            fallback = device['udid']
-print(booted or fallback or '')
-"
-}
-
-device_is_available() {
-    local id="$1"
-    xcrun simctl list devices available -j | DEVICE_ID="$id" python3 -c "
-import json, os, sys
-target = os.environ.get('DEVICE_ID', '')
-for runtime, device_list in json.load(sys.stdin).get('devices', {}).items():
-    for device in device_list:
-        if device.get('udid') == target and device.get('isAvailable', False):
-            sys.exit(0)
-sys.exit(1)
-"
-}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=resolve_simulator.sh
+source "$SCRIPT_DIR/resolve_simulator.sh"
+IOS_BUILD_TEST_SIM_POOL_ACQUIRED=0
 
 WORKSPACE=$(find . -maxdepth 1 -name "*.xcworkspace" ! -name "Pods.xcworkspace" | head -n 1)
 PROJECT=$(find . -maxdepth 1 -name "*.xcodeproj" ! -name "Pods.xcodeproj" | head -n 1)
@@ -150,19 +122,10 @@ else
     fi
 fi
 
-if [ -n "${DEVICE_ID:-}" ] && ! device_is_available "$DEVICE_ID"; then
-    progress "Warning: DEVICE_ID=$DEVICE_ID is not available; picking another iPhone simulator."
-    DEVICE_ID=""
+if ! ios_build_test_resolve_device_id; then
+    exit 1
 fi
-
-if [ -z "${DEVICE_ID:-}" ]; then
-    DEVICE_ID=$(pick_available_iphone || true)
-    if [ -z "$DEVICE_ID" ]; then
-        echo "Error: No simulator found. Please add DEVICE_ID to .env file"
-        echo "Run: xcrun simctl list devices available"
-        exit 1
-    fi
-fi
+ios_build_test_boot_simulator
 
 DESTINATION="platform=iOS Simulator,id=$DEVICE_ID"
 
@@ -289,7 +252,7 @@ run_tests() {
     local name="$2"
 
     mkdir -p .test_logs
-    log_file=".test_logs/${target}_$(date +%Y%m%d_%H%M%S).log"
+    log_file=".test_logs/${target////_}_$(date +%Y%m%d_%H%M%S).log"
     local start_epoch
     start_epoch=$(date +%s)
 
@@ -325,7 +288,12 @@ run_tests() {
     # exit, crash, or test timeout" relaunch loop. We handle that below by killing
     # xcodebuild's process group the moment a crash marker shows up in the log.
     # (Don't add -test-iterations 1 — xcodebuild rejects values < 2.)
-    TEST_CMD=(xcodebuild test "$PROJECT_FLAG" "$PROJECT_FILE" -scheme "$SCHEME" -destination "$DESTINATION" -derivedDataPath "$DERIVED_DATA_PATH" -only-testing:"$target")
+    TEST_CMD=(xcodebuild test "$PROJECT_FLAG" "$PROJECT_FILE" -scheme "$SCHEME" -destination "$DESTINATION" -derivedDataPath "$DERIVED_DATA_PATH" -only-testing:"$target"
+        -test-timeouts-enabled YES
+        -default-test-execution-time-allowance "${TEST_TIMEOUT_SECS:-60}"
+        -maximum-test-execution-time-allowance "${TEST_TIMEOUT_SECS:-60}")
+    # A single hung test (e.g. StoreKitTest failing to start in the simulator) used to block the
+    # run forever; the per-test allowance above turns it into a failure. Override: TEST_TIMEOUT_SECS=120.
 
     # Markers that mean "the test process died, stop waiting for xcodebuild to
     # finish on its own." Kept narrow on purpose: only signatures that
@@ -370,8 +338,27 @@ run_tests() {
 
     # Poll: either xcodebuild finishes naturally, or the watcher drops a
     # sentinel signalling a crash. Cheap loop, no extra deps.
+    #
+    # After tests finish, xcodebuild may block up to 600s on `simctl diagnose`
+    # collecting simulator logs (especially on failure). The test log already
+    # has pass/fail details, so kill diagnose after a short grace period.
     local last_heartbeat=0
+    local tests_done=0
+    local tests_done_at=0
     while kill -0 "$xcb_pid" 2>/dev/null; do
+        if [ "$tests_done" -eq 0 ] && grep -qE "Test Suite 'All tests' (passed|failed)|\*\* TEST (SUCCEEDED|FAILED) \*\*" "$log_file" 2>/dev/null; then
+            tests_done=1
+            tests_done_at=$(date +%s)
+        fi
+        if [ "$tests_done" -eq 1 ]; then
+            local since_done=$(( $(date +%s) - tests_done_at ))
+            if [ "$since_done" -ge 15 ]; then
+                pkill -TERM -f "simctl diagnose.*${DEVICE_ID}" 2>/dev/null || true
+            fi
+            if [ "$since_done" -ge 30 ]; then
+                pkill -KILL -f "simctl diagnose" 2>/dev/null || true
+            fi
+        fi
         if [ -e "${log_file}.crash" ]; then
             crash_detected=1
             # TERM the process group, then escalate.

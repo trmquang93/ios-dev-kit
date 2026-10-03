@@ -52,38 +52,10 @@ else
     fi
 fi
 
-pick_available_iphone() {
-    xcrun simctl list devices available -j | python3 -c "
-import sys, json
-devices = json.load(sys.stdin)['devices']
-booted = None
-fallback = None
-for runtime, device_list in devices.items():
-    if 'iOS' not in runtime:
-        continue
-    for device in device_list:
-        if 'iPhone' not in device.get('name', '') or not device.get('isAvailable', False):
-            continue
-        if device.get('state') == 'Booted' and booted is None:
-            booted = device['udid']
-        if fallback is None:
-            fallback = device['udid']
-print(booted or fallback or '')
-"
-}
-
-device_is_available() {
-    local id="$1"
-    xcrun simctl list devices available -j | DEVICE_ID="$id" python3 -c "
-import json, os, sys
-target = os.environ.get('DEVICE_ID', '')
-for runtime, device_list in json.load(sys.stdin).get('devices', {}).items():
-    for device in device_list:
-        if device.get('udid') == target and device.get('isAvailable', False):
-            sys.exit(0)
-sys.exit(1)
-"
-}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=resolve_simulator.sh
+source "$SCRIPT_DIR/resolve_simulator.sh"
+IOS_BUILD_TEST_SIM_POOL_ACQUIRED=0
 
 WORKSPACE=$(find . -maxdepth 1 -name "*.xcworkspace" ! -name "Pods.xcworkspace" | head -n 1)
 PROJECT=$(find . -maxdepth 1 -name "*.xcodeproj" ! -name "Pods.xcodeproj" | head -n 1)
@@ -124,19 +96,10 @@ else
     fi
 fi
 
-if [ -n "${DEVICE_ID:-}" ] && ! device_is_available "$DEVICE_ID"; then
-    echo "Warning: DEVICE_ID=$DEVICE_ID is not available; picking another iPhone simulator."
-    DEVICE_ID=""
+if ! ios_build_test_resolve_device_id; then
+    exit 1
 fi
-
-if [ -z "${DEVICE_ID:-}" ]; then
-    DEVICE_ID=$(pick_available_iphone || true)
-    if [ -z "$DEVICE_ID" ]; then
-        echo "Error: No simulator found. Please add DEVICE_ID to .env file"
-        echo "Run: xcrun simctl list devices available"
-        exit 1
-    fi
-fi
+ios_build_test_boot_simulator
 
 DESTINATION="platform=iOS Simulator,id=$DEVICE_ID"
 

@@ -5,6 +5,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -22,6 +23,9 @@ DEFAULT_TIMEOUT = 600
 DEFAULT_TTL = 900
 DEFAULT_POLL = 5
 DEFAULT_PREFER = "shutdown"
+CLONE_UDID_RE = re.compile(
+    r"\(([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})\)\.?\s*$"
+)
 
 
 def pool_home() -> Path:
@@ -57,9 +61,23 @@ def config_path(home: Path) -> Path:
     return home / "config.json"
 
 
+def default_ephemeral() -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "clones_only": True,
+        "clone_udid": "",
+        "max_concurrent": 8,
+        "max_devices": 16,
+        "name_prefix": "sim-pool-ephemeral-",
+        "delete_on_release": False,
+    }
+
+
 def default_config() -> dict[str, Any]:
     return {
         "devices": [],
+        "ephemeral_devices": [],
+        "ephemeral": default_ephemeral(),
         "defaults": {
             "timeout_seconds": DEFAULT_TIMEOUT,
             "ttl_seconds": DEFAULT_TTL,
@@ -79,6 +97,21 @@ def load_config(home: Path) -> dict[str, Any]:
     data["defaults"] = defaults
     if "devices" not in data:
         data["devices"] = []
+    if "ephemeral_devices" not in data:
+        data["ephemeral_devices"] = []
+    ephemeral = default_ephemeral()
+    ephemeral.update(data.get("ephemeral", {}))
+    flag = os.environ.get("SIM_POOL_EPHEMERAL", "").strip().lower()
+    if flag in ("0", "false", "no", "off"):
+        ephemeral["enabled"] = False
+    elif flag in ("1", "true", "yes", "on"):
+        ephemeral["enabled"] = True
+    clone_flag = os.environ.get("SIM_POOL_CLONES_ONLY", "").strip().lower()
+    if clone_flag in ("0", "false", "no", "off"):
+        ephemeral["clones_only"] = False
+    elif clone_flag in ("1", "true", "yes", "on"):
+        ephemeral["clones_only"] = True
+    data["ephemeral"] = ephemeral
     return data
 
 
@@ -163,7 +196,9 @@ def remove_lease(path: Path) -> bool:
     return False
 
 
-def simctl_devices() -> dict[str, dict[str, Any]]:
+def simctl_devices(iphone_only: bool = False) -> dict[str, dict[str, Any]]:
+    # Ephemeral clones are named "sim-pool-ephemeral-*" (no "iPhone"), so lease/GC lookups
+    # must see every iOS device; only template discovery filters to iPhones.
     try:
         proc = subprocess.run(
             ["xcrun", "simctl", "list", "devices", "available", "-j"],
@@ -183,7 +218,7 @@ def simctl_devices() -> dict[str, dict[str, Any]]:
                 continue
             name = device.get("name", "")
             udid = device.get("udid", "")
-            if not udid or "iPhone" not in name:
+            if not udid or (iphone_only and "iPhone" not in name):
                 continue
             state = device.get("state", "Shutdown")
             out[udid] = {"name": name, "state": state, "runtime": runtime}
@@ -191,7 +226,7 @@ def simctl_devices() -> dict[str, dict[str, Any]]:
 
 
 def discover_iphone_udids(limit: int = 10) -> list[str]:
-    devices = simctl_devices()
+    devices = simctl_devices(iphone_only=True)
     preferred = (
         "iPhone 16 Pro",
         "iPhone 16",
@@ -240,11 +275,24 @@ def active_leases(home: Path, config: dict[str, Any]) -> dict[str, dict[str, Any
     return leases
 
 
-def should_drop_lease(lease: dict[str, Any], config: dict[str, Any], now: datetime | None = None) -> tuple[bool, str]:
+def should_drop_lease(
+    lease: dict[str, Any],
+    config: dict[str, Any],
+    now: datetime | None = None,
+    sim_info: dict[str, dict[str, Any]] | None = None,
+) -> tuple[bool, str]:
     now = now or datetime.now(timezone.utc)
     ttl = int(config["defaults"].get("ttl_seconds", DEFAULT_TTL))
     if lease_corrupt(lease, ttl, now):
         return True, "corrupt"
+    udid = lease.get("udid", "")
+    if (
+        udid
+        and sim_info is not None
+        and is_ephemeral_udid(config, udid)
+        and udid not in sim_info
+    ):
+        return True, "missing_sim"
     pid = int(lease.get("pid", 0))
     if not pid_alive(pid):
         return True, "dead_pid"
@@ -253,22 +301,59 @@ def should_drop_lease(lease: dict[str, Any], config: dict[str, Any], now: dateti
     return False, ""
 
 
+def is_ghost_ephemeral(
+    config: dict[str, Any],
+    udid: str,
+    sim_info: dict[str, dict[str, Any]],
+    now: datetime | None = None,
+) -> bool:
+    """An ephemeral clone is a ghost once it has been missing from CoreSimulator for a while.
+
+    The grace period covers freshly provisioned clones (sim_info may be slightly stale)
+    and test doubles with synthetic UDIDs; lease GC handles vanished clones immediately.
+    """
+    now = now or datetime.now(timezone.utc)
+    entry = next((e for e in config.get("ephemeral_devices", []) if e.get("udid") == udid), None)
+    if entry is None or udid in sim_info:
+        return False
+    try:
+        age = (now - parse_iso(entry.get("created_at", ""))).total_seconds()
+    except ValueError:
+        age = 0
+    return age >= 600
+
+
+def prune_ephemeral_not_in_simctl(home: Path, config: dict[str, Any], sim_info: dict[str, dict[str, Any]]) -> None:
+    """Drop registry entries for clones that CoreSimulator no longer has and nothing leases."""
+    for entry in list(config.get("ephemeral_devices", [])):
+        udid = entry.get("udid", "")
+        if not udid or lease_path(home, udid).is_file():
+            continue
+        if is_ghost_ephemeral(config, udid, sim_info):
+            remove_ephemeral_device(home, config, udid)
+
+
 def gc(home: Path, config: dict[str, Any]) -> list[str]:
     dropped: list[str] = []
+    sim_info = simctl_devices()
     leases_dir = home / "leases"
-    if not leases_dir.is_dir():
-        return dropped
-    for path in sorted(leases_dir.glob("*.json")):
-        lease = read_lease(path)
-        if not lease:
-            path.unlink(missing_ok=True)
-            dropped.append(path.stem)
-            continue
-        drop, reason = should_drop_lease(lease, config)
-        if drop:
-            udid = lease.get("udid", path.stem)
-            remove_lease(path)
-            dropped.append(f"{udid}:{reason}")
+    if leases_dir.is_dir():
+        for path in sorted(leases_dir.glob("*.json")):
+            lease = read_lease(path)
+            if not lease:
+                path.unlink(missing_ok=True)
+                dropped.append(path.stem)
+                continue
+            drop, reason = should_drop_lease(lease, config, sim_info=sim_info)
+            if drop:
+                udid = lease.get("udid", path.stem)
+                if reason == "missing_sim":
+                    remove_ephemeral_device(home, config, udid)
+                else:
+                    cleanup_ephemeral_lease(home, config, lease)
+                remove_lease(path)
+                dropped.append(f"{udid}:{reason}")
+    prune_ephemeral_not_in_simctl(home, config, sim_info)
     return dropped
 
 
@@ -286,6 +371,243 @@ def leased_udids(home: Path, config: dict[str, Any]) -> set[str]:
         if udid:
             out.add(udid)
     return out
+
+
+def pool_device_udids(config: dict[str, Any]) -> list[str]:
+    ephemeral = [e["udid"] for e in config.get("ephemeral_devices", []) if e.get("udid")]
+    return list(config.get("devices", [])) + ephemeral
+
+
+def clones_only_mode(config: dict[str, Any]) -> bool:
+    return bool(config.get("ephemeral", {}).get("clones_only", True))
+
+
+def template_udids(config: dict[str, Any]) -> set[str]:
+    templates = set(config.get("devices", []))
+    clone = (config.get("ephemeral", {}) or {}).get("clone_udid", "")
+    if isinstance(clone, str) and clone.strip():
+        templates.add(clone.strip())
+    return templates
+
+
+def is_template_udid(config: dict[str, Any], udid: str) -> bool:
+    return udid in template_udids(config)
+
+
+def leasable_udids(config: dict[str, Any]) -> list[str]:
+    if clones_only_mode(config):
+        return [e["udid"] for e in config.get("ephemeral_devices", []) if e.get("udid")]
+    return pool_device_udids(config)
+
+
+def is_ephemeral_udid(config: dict[str, Any], udid: str) -> bool:
+    return any(e.get("udid") == udid for e in config.get("ephemeral_devices", []))
+
+
+def simslim_available() -> bool:
+    try:
+        subprocess.run(
+            ["simslim", "list"],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def resolve_clone_source_udid(config: dict[str, Any], sim_info: dict[str, dict[str, Any]]) -> str | None:
+    ephem = config.get("ephemeral", {})
+    preferred = (ephem.get("clone_udid") or "").strip()
+    if preferred and preferred in sim_info:
+        return preferred
+    for udid in config.get("devices", []):
+        if udid in sim_info:
+            return udid
+    prefix = ephem.get("name_prefix", "sim-pool-ephemeral-")
+    for udid, info in sim_info.items():
+        name = info.get("name", "")
+        if "iPhone" in name and not name.startswith(prefix):
+            return udid
+    return None
+
+
+def count_ephemeral_leases(home: Path, config: dict[str, Any]) -> int:
+    count = 0
+    for path in (home / "leases").glob("*.json"):
+        lease = read_lease(path)
+        if not lease:
+            continue
+        drop, _ = should_drop_lease(lease, config)
+        if drop:
+            continue
+        if lease.get("ephemeral") or is_ephemeral_udid(config, lease.get("udid", "")):
+            count += 1
+    return count
+
+
+def can_provision_ephemeral(home: Path, config: dict[str, Any]) -> bool:
+    ephem = config.get("ephemeral", {})
+    if not ephem.get("enabled", True):
+        return False
+    if not simslim_available() and not os.environ.get("SIM_POOL_TEST_PROVISION_UDID"):
+        return False
+    max_devices = int(ephem.get("max_devices", 16))
+    max_concurrent = int(ephem.get("max_concurrent", 8))
+    ephemeral_count = len(config.get("ephemeral_devices", []))
+    if ephemeral_count >= max_devices:
+        return False
+    if count_ephemeral_leases(home, config) >= max_concurrent:
+        return False
+    return True
+
+
+def parse_clone_udid(output: str) -> str | None:
+    for line in output.splitlines():
+        match = CLONE_UDID_RE.search(line.strip())
+        if match:
+            return match.group(1)
+    return None
+
+
+def add_ephemeral_device(home: Path, config: dict[str, Any], udid: str, name: str, source_udid: str) -> None:
+    devices = list(config.get("ephemeral_devices", []))
+    if any(e.get("udid") == udid for e in devices):
+        return
+    devices.append(
+        {
+            "udid": udid,
+            "name": name,
+            "clone_source": source_udid,
+            "created_at": now_iso(),
+        }
+    )
+    config["ephemeral_devices"] = devices
+    save_config(home, config)
+
+
+def remove_ephemeral_device(home: Path, config: dict[str, Any], udid: str) -> None:
+    # Read-modify-write against the disk state: concurrent sim-pool processes may have
+    # added entries since this process loaded its config; a wholesale save would clobber them.
+    fresh = load_config(home)
+    fresh["ephemeral_devices"] = [
+        e for e in fresh.get("ephemeral_devices", []) if e.get("udid") != udid
+    ]
+    save_config(home, fresh)
+    config["ephemeral_devices"] = fresh["ephemeral_devices"]
+
+
+def destroy_ephemeral_simulator(udid: str) -> None:
+    subprocess.run(["simslim", "shutdown", udid], capture_output=True, text=True)
+    subprocess.run(["simslim", "delete", udid], capture_output=True, text=True)
+
+
+def cleanup_ephemeral_lease(home: Path, config: dict[str, Any], lease: dict[str, Any]) -> None:
+    if not lease.get("ephemeral"):
+        return
+    if not config.get("ephemeral", {}).get("delete_on_release", False):
+        return
+    udid = lease.get("udid", "")
+    if not udid:
+        return
+    destroy_ephemeral_simulator(udid)
+    remove_ephemeral_device(home, config, udid)
+
+
+def provision_ephemeral_simulator(home: Path, config: dict[str, Any]) -> str | None:
+    test_udid = os.environ.get("SIM_POOL_TEST_PROVISION_UDID", "").strip()
+    if test_udid:
+        add_ephemeral_device(home, config, test_udid, "test-ephemeral", "test")
+        return test_udid
+
+    sim_info = simctl_devices()
+    source = resolve_clone_source_udid(config, sim_info)
+    if not source:
+        return None
+    prefix = config.get("ephemeral", {}).get("name_prefix", "sim-pool-ephemeral-")
+    name = f"{prefix}{uuid.uuid4().hex[:8]}"
+    output = ""
+    try:
+        proc = subprocess.run(
+            ["simslim", "clone", source, name],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        output = (proc.stdout or "") + (proc.stderr or "")
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        output = (getattr(exc, "stdout", "") or "") + (getattr(exc, "stderr", "") or "")
+        err = output.strip() or str(exc)
+        print(f"EPHEMERAL_PROVISION_FAILED {err}", file=sys.stderr)
+        # fall through: the simctl clone step may have succeeded even when a later
+        # simslim step (boot/slim) failed — adopt the device instead of orphaning it
+    new_udid = parse_clone_udid(output)
+    if not new_udid:
+        new_udid = next(
+            (udid for udid, info in simctl_devices().items() if info.get("name") == name),
+            None,
+        )
+    if not new_udid:
+        print(f"EPHEMERAL_PROVISION_FAILED could not parse clone output: {output}", file=sys.stderr)
+        return None
+    add_ephemeral_device(home, config, new_udid, name, source)
+    return new_udid
+
+
+def ephemeral_enabled_for_acquire(args: argparse.Namespace, config: dict[str, Any]) -> bool:
+    if getattr(args, "no_ephemeral", False):
+        return False
+    return bool(config.get("ephemeral", {}).get("enabled", True))
+
+
+def should_provision_clone(args: argparse.Namespace, home: Path, config: dict[str, Any]) -> bool:
+    if getattr(args, "no_ephemeral", False):
+        return False
+    if not ephemeral_enabled_for_acquire(args, config):
+        return False
+    if not can_provision_ephemeral(home, config):
+        return False
+    prefer = config["defaults"].get("prefer", DEFAULT_PREFER)
+    return pick_free_udid(home, config, None, prefer) is None
+
+
+def grant_lease(
+    home: Path,
+    config: dict[str, Any],
+    udid: str,
+    owner: str,
+    args: argparse.Namespace,
+    ttl: int,
+) -> int:
+    lease_id = str(uuid.uuid4())
+    acquired_at = now_iso()
+    expires_at = datetime.now(timezone.utc).timestamp() + ttl
+    expires_iso = datetime.fromtimestamp(expires_at, timezone.utc).replace(microsecond=0).isoformat()
+    sim_info = simctl_devices()
+    name = sim_info.get(udid, {}).get("name", "unknown")
+    ephemeral = is_ephemeral_udid(config, udid)
+    lease = {
+        "lease_id": lease_id,
+        "udid": udid,
+        "owner": owner,
+        "pid": resolve_holder_pid(args.holder_pid),
+        "project": args.project or "",
+        "worktree": args.worktree or "",
+        "session": args.session or "",
+        "purpose": args.purpose or "qa",
+        "acquired_at": acquired_at,
+        "expires_at": expires_iso,
+        "ephemeral": ephemeral,
+    }
+    write_lease(lease_path(home, udid), lease)
+    print(f"LEASE_ID={lease_id}")
+    print(f"UDID={udid}")
+    print(f"SIMULATOR_NAME={name}")
+    print(f"EXPIRES_AT={expires_iso}")
+    print(f"EPHEMERAL={'true' if ephemeral else 'false'}")
+    return EXIT_OK
 
 
 def device_sort_key(
@@ -308,15 +630,20 @@ def pick_free_udid(
     prefer_udid: str | None,
     prefer: str,
 ) -> str | None:
-    devices = config.get("devices", [])
+    devices = leasable_udids(config)
     if not devices:
         return None
     leased = leased_udids(home, config)
     sim_info = simctl_devices()
-    free = [udid for udid in devices if udid not in leased]
+    free = [
+        udid
+        for udid in devices
+        if udid not in leased
+        and (not is_ephemeral_udid(config, udid) or not is_ghost_ephemeral(config, udid, sim_info))
+    ]
     if not free:
         return None
-    if prefer_udid and prefer_udid in free:
+    if prefer_udid and prefer_udid in free and not is_template_udid(config, prefer_udid):
         return prefer_udid
     free.sort(key=lambda u: device_sort_key(u, sim_info, prefer))
     return free[0]
@@ -333,18 +660,26 @@ def find_lease_by_id(home: Path, lease_id: str) -> tuple[Path | None, dict[str, 
 def cmd_status(home: Path) -> int:
     config = load_config(home)
     gc(home, config)
-    devices = config.get("devices", [])
+    devices = leasable_udids(config)
     sim_info = simctl_devices()
     now = datetime.now(timezone.utc)
     print(f"pool_home={home}")
-    print(f"devices_whitelisted={len(devices)}")
+    print(f"templates={len(config.get('devices', []))} clones_only={clones_only_mode(config)}")
+    print(f"devices_ephemeral={len(config.get('ephemeral_devices', []))}")
+    print(f"devices_leasable={len(devices)}")
+    for udid in sorted(template_udids(config)):
+        name = sim_info.get(udid, {}).get("name", "unknown")
+        state = sim_info.get(udid, {}).get("state", "unknown")
+        print(f"TEMPLATE\t{udid}\t{name}\t{state}\t(not leased for QA)")
     for udid in devices:
         path = lease_path(home, udid)
         lease = read_lease(path)
         name = sim_info.get(udid, {}).get("name", "unknown")
         state = sim_info.get(udid, {}).get("state", "unknown")
+        kind = "ephemeral" if is_ephemeral_udid(config, udid) else "pool"
         if not lease:
-            print(f"FREE\t{udid}\t{name}\t{state}")
+            marker = "MISSING" if is_ghost_ephemeral(config, udid, sim_info) else "FREE"
+            print(f"{marker}\t{udid}\t{name}\t{state}\t{kind}")
             continue
         drop, reason = should_drop_lease(lease, config, now)
         if drop:
@@ -356,7 +691,7 @@ def cmd_status(home: Path) -> int:
         expires = lease.get("expires_at", "")
         lease_id = lease.get("lease_id", "")
         print(
-            f"LEASED\t{udid}\t{name}\t{state}\t"
+            f"LEASED\t{udid}\t{name}\t{state}\t{kind}\t"
             f"lease_id={lease_id}\towner={owner}\tproject={project}\tpid={pid}\texpires_at={expires}"
         )
     return EXIT_OK
@@ -375,40 +710,27 @@ def cmd_acquire(args: argparse.Namespace, home: Path) -> int:
     deadline = time.monotonic() + timeout
     owner = args.owner or f"agent-{os.getpid()}"
     while True:
-        with pool_lock(home):
-            gc(home, config)
-            udid = pick_free_udid(home, config, args.prefer_udid, prefer)
-            if udid:
-                lease_id = str(uuid.uuid4())
-                acquired_at = now_iso()
-                expires_at = (
-                    datetime.now(timezone.utc).timestamp() + ttl
-                )
-                expires_iso = datetime.fromtimestamp(expires_at, timezone.utc).replace(microsecond=0).isoformat()
-                sim_info = simctl_devices()
-                name = sim_info.get(udid, {}).get("name", "unknown")
-                lease = {
-                    "lease_id": lease_id,
-                    "udid": udid,
-                    "owner": owner,
-                    "pid": resolve_holder_pid(args.holder_pid),
-                    "project": args.project or "",
-                    "worktree": args.worktree or "",
-                    "session": args.session or "",
-                    "purpose": args.purpose or "qa",
-                    "acquired_at": acquired_at,
-                    "expires_at": expires_iso,
-                }
-                write_lease(lease_path(home, udid), lease)
-                print(f"LEASE_ID={lease_id}")
-                print(f"UDID={udid}")
-                print(f"SIMULATOR_NAME={name}")
-                print(f"EXPIRES_AT={expires_iso}")
-                return EXIT_OK
         if time.monotonic() >= deadline:
             print("SIM_POOL_BUSY", file=sys.stderr)
             return EXIT_BUSY
-        time.sleep(poll)
+        with pool_lock(home):
+            gc(home, config)
+            config = load_config(home)
+            udid = pick_free_udid(home, config, args.prefer_udid, prefer)
+            if udid:
+                return grant_lease(home, config, udid, owner, args, ttl)
+            try_ephemeral = should_provision_clone(args, home, config)
+        if try_ephemeral:
+            new_udid = provision_ephemeral_simulator(home, load_config(home))
+            if new_udid:
+                # Lease our own clone atomically: waiting for the shared pick queue lets
+                # other acquirers snipe it during the poll sleep, causing endless re-cloning.
+                with pool_lock(home):
+                    config = load_config(home)
+                    if not read_lease(lease_path(home, new_udid)):
+                        return grant_lease(home, config, new_udid, owner, args, ttl)
+        else:
+            time.sleep(poll)
 
 
 def cmd_renew(args: argparse.Namespace, home: Path) -> int:
@@ -437,15 +759,20 @@ def cmd_renew(args: argparse.Namespace, home: Path) -> int:
 
 def cmd_release(args: argparse.Namespace, home: Path) -> int:
     with pool_lock(home):
+        config = load_config(home)
+        lease: dict[str, Any] | None = None
+        path: Path | None = None
         if args.lease:
             path, lease = find_lease_by_id(home, args.lease)
-            if path and lease:
-                remove_lease(path)
         elif args.udid:
-            remove_lease(lease_path(home, args.udid))
+            path = lease_path(home, args.udid)
+            lease = read_lease(path)
         else:
             print("release requires --lease or --udid", file=sys.stderr)
             return EXIT_ERROR
+        if path and lease:
+            cleanup_ephemeral_lease(home, config, lease)
+            remove_lease(path)
     return EXIT_OK
 
 
@@ -526,7 +853,17 @@ def cmd_doctor(home: Path) -> int:
     print("  sim-pool release --lease <id>")
     print("")
     print("Orphan recovery: TTL + dead-pid GC; release is polite not required.")
-    print("On SIM_POOL_BUSY (exit 2): report inconclusive; do not create simulators.")
+    ephem = config.get("ephemeral", {})
+    if ephem.get("clones_only", True):
+        print("clones_only: templates are never leased — every acquire uses or creates a simslim clone.")
+    if ephem.get("enabled", True):
+        if config.get("ephemeral", {}).get("delete_on_release", False):
+            print("Ephemeral: simslim clone from template; delete on release/TTL GC.")
+        else:
+            print("Ephemeral: simslim clone from template; clones kept until you delete manually (delete_on_release=false).")
+        print(f"  clone_udid={ephem.get('clone_udid') or '(first template iPhone)'}")
+    else:
+        print("On SIM_POOL_BUSY (exit 2): report inconclusive (ephemeral disabled).")
     return EXIT_OK
 
 
@@ -570,6 +907,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_acquire.add_argument("--timeout", type=int, default=None)
     p_acquire.add_argument("--ttl", type=int, default=None)
     p_acquire.add_argument("--holder-pid", type=int, default=None)
+    p_acquire.add_argument(
+        "--no-ephemeral",
+        action="store_true",
+        help="Do not simslim-clone when the pool is busy",
+    )
 
     p_renew = sub.add_parser("renew", help="Extend lease TTL")
     p_renew.add_argument("--lease", required=True)

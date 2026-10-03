@@ -1,6 +1,6 @@
 ---
 name: ios-build-test
-description: Build and test any iOS Xcode project. MANDATORY for all iOS build and test operations — always use this skill's scripts instead of running xcodebuild directly. CRITICAL — invoke build.sh and run_tests.sh as the ONLY command in the shell; NEVER append | tee, | tail, | head, or | grep (causes hung pipelines that outlive a finished Xcode run). Use when user asks to build, compile, run tests, or verify an iOS project. Supports xcworkspace/xcodeproj auto-detection, Rosetta mode, Swift Testing and XCTest.
+description: Build and test any iOS Xcode project. MANDATORY for all iOS build and test operations — always use this skill's scripts instead of running xcodebuild directly. Simulator policy matches sim-pool + simslim (lease before build/test; ephemeral clone when pool busy; no stealing another agent's UDID). CRITICAL — invoke build.sh and run_tests.sh as the ONLY command in the shell; NEVER append | tee, | tail, | head, or | grep. Supports xcworkspace/xcodeproj auto-detection, Rosetta mode, Swift Testing and XCTest.
 allowed-tools: Bash, Read, Write, Edit, Glob, Grep
 ---
 
@@ -47,6 +47,43 @@ ${CLAUDE_SKILL_DIR}/scripts/build.sh --scheme "nowlist" 2>&1 | grep -E "error:|s
 ## Agent workflow (read this first)
 
 Follow these steps **every time** you build or test after code changes.
+
+### 0. Simulator — sim-pool + simslim (before build/test)
+
+Read the **`sim-pool`** skill. `build.sh` and `run_tests.sh` enforce the same rules:
+
+| Rule | Behavior |
+|------|----------|
+| **Clones only** | **`sim-pool acquire`** never leases the template iPhone — only a **clone**. Scripts **reject** `DEVICE_ID` if it matches a template in `~/.agent-sim-pool/config.json`. |
+| **Lease** | With `DEVICE_ID` unset, scripts call **`sim-pool acquire`** (or use `.build_logs/.sim-pool-session.env` from an earlier script run in this worktree). |
+| **No stealing** | If `DEVICE_ID` is set but missing from simctl, scripts **fail** — they do not auto-pick another iPhone. |
+| **Boot** | **`simslim boot "$DEVICE_ID"`** before xcodebuild (skip with `SIMSLIM_SKIP_BOOT=1`). |
+| **Ephemeral** | Busy pool → simslim clone (default); **`sim-pool release`** deletes ephemeral sims. |
+| **Legacy solo** | `SIM_POOL_SKIP=1` restores old “pick any booted iPhone” behavior (unsafe with multiple agents). |
+
+**Recommended agent session** (one lease for build + tests + UI QA):
+
+```bash
+SP="${HOME}/.claude/skills/sim-pool/scripts/sim-pool"
+SESSION="qa-$(basename "$PWD")-$$"
+
+eval "$($SP acquire --holder-pid $$ --owner "agent-$$" --project "$(basename "$PWD")" --worktree "$PWD" --session "$SESSION")"
+export DEVICE_ID="$UDID"
+export SIM_POOL_LEASE_ID="$LEASE_ID"
+# simslim boot runs inside build.sh / run_tests.sh unless already booted
+
+${CLAUDE_SKILL_DIR}/scripts/build.sh --scheme "MyApp"
+${CLAUDE_SKILL_DIR}/scripts/run_tests.sh --scheme "MyApp" unit
+
+# … agent-device / sim-eyes on same DEVICE_ID + session …
+
+$SP release --lease "$SIM_POOL_LEASE_ID"
+rm -f .build_logs/.sim-pool-session.env
+```
+
+If you **omit** `export DEVICE_ID`, the first `build.sh` / `run_tests.sh` will acquire for you and write `.build_logs/.sim-pool-session.env` so the second script reuses the same UDID. You must still **`sim-pool release`** when QA ends.
+
+**Do not** commit `DEVICE_ID` in project `.env` on shared Macs. **Do not** use `xcrun simctl boot` — use simslim.
 
 ### ⚠️ Invoke scripts directly — never pipe (critical)
 
@@ -206,7 +243,8 @@ ${CLAUDE_SKILL_DIR}/scripts/run_tests.sh single MyAppTests --scheme "Top Music"
 |---------|-------------------|
 | Pick workspace vs project | Prefers `*.xcworkspace` (excludes Pods) |
 | Pick scheme | `--scheme` → `.env SCHEME` → name match → first non-Pods scheme |
-| Pick simulator | `.env DEVICE_ID` → first available iPhone simulator |
+| Pick simulator | `DEVICE_ID` env / sim-pool acquire / session file → **never** steal another sim |
+| Boot simulator | `simslim boot` inside scripts (see `resolve_simulator.sh`) |
 | Isolated DerivedData | Uses project-local `.derivedData` (override with `DERIVED_DATA_PATH` in `.env`) |
 | Capture output | Writes `.build_logs/build_YYYYMMDD_HHMMSS.log` (or `.test_logs/…`) |
 | Detect silent failures | Scans log for `file:line:col: error:` even if xcodebuild exits 0 |
@@ -220,13 +258,22 @@ ${CLAUDE_SKILL_DIR}/scripts/run_tests.sh single MyAppTests --scheme "Top Music"
 Create `.env` in the project root to avoid repeated flags:
 
 ```bash
-DEVICE_ID=4019771F-38B3-4DA7-B4D7-B458E99A5394  # from: xcrun simctl list devices available
 SCHEME=MyApp
 # ROSETTA=true  # optional; also auto-detected from Podfile EXCLUDED_ARCHS arm64
 # DERIVED_DATA_PATH=.derivedData  # optional; this is the default
+# SIM_POOL_SKIP=1  # solo Mac only — allow auto-pick any iPhone (not for multi-agent)
 ```
 
-`.env` is optional; scripts auto-detect when omitted. If `DEVICE_ID` is missing or no longer available, the scripts pick a booted (else first available) iPhone simulator.
+**Do not** put a long-lived `DEVICE_ID` in `.env` on a shared Mac. Export it per QA session from **`sim-pool acquire`**, or let `build.sh` / `run_tests.sh` acquire once (see `.build_logs/.sim-pool-session.env`).
+
+| Variable | Purpose |
+|----------|---------|
+| `DEVICE_ID` | Leased simulator UDID for this session |
+| `SIM_POOL_LEASE_ID` | Pass to `sim-pool release` when done |
+| `SIM_POOL_SKIP=1` | Legacy: auto-pick any available iPhone |
+| `SIM_POOL_CLI` | Override path to `sim-pool` script |
+| `SIM_POOL_SESSION` | Session name when script acquires for you |
+| `SIMSLIM_SKIP_BOOT=1` | Skip `simslim boot` if already booted |
 
 ---
 
@@ -290,25 +337,28 @@ The test script also detects xctest process crashes (`=== TEST PROCESS CRASHED =
 
 ### Simulator
 
-1. `DEVICE_ID` in `.env`
-2. First available iPhone from `xcrun simctl list devices available -j`
+1. `DEVICE_ID` in environment (from **`sim-pool acquire`**)
+2. Else `.build_logs/.sim-pool-session.env` from an earlier `build.sh` / `run_tests.sh` in this worktree
+3. Else **`sim-pool acquire`** (scripts call it automatically)
+4. Else with `SIM_POOL_SKIP=1` only: first booted / available iPhone via simctl
 
 ---
 
 ## Rules for agents
 
 1. **Never** call `xcodebuild` directly — use `build.sh` / `run_tests.sh`.
-2. **Always** `cd` to the project root first.
-3. **Always wait for the script to finish** — use `block_until_ms: 300000` or higher; do not abort during quiet compiles.
-4. **Never pipe** `build.sh` or `run_tests.sh` — no `| tee`, `| tail`, `| head`, `| grep`, or `2>&1 | …` of any kind. The command string must end at the script's last argument. Read `.build_logs/` / `.test_logs/` afterward instead.
-5. **Never truncate live output** to save tokens — if the full terminal buffer is too long, read the log file path from the script's final lines.
-6. **Always** read the log file on failure before attempting fixes (use the **Next steps** the script prints).
-7. **Always** rebuild after compile fixes and wait again until `✓ Build succeeded`.
-8. Use `--scheme` when the app name contains spaces or doesn't match the repo folder.
-9. Use `--verbose` when failure summary is empty, exit code is ambiguous, or you need live progress.
-10. Request `all` sandbox permissions for Xcode tool invocations.
-11. **Do not** background the command just because output pauses after the preflight block — xcodebuild is still running in quiet mode.
-12. If the user reports "Xcode finished in a minute but your terminal hung", assume a piped command — kill it and re-run without a pipe.
+2. **Simulator:** follow **`sim-pool`** — lease before build/test, `simslim boot`, `release` when done; never grab a random booted sim unless `SIM_POOL_SKIP=1`.
+3. **Always** `cd` to the project root first.
+4. **Always wait for the script to finish** — use `block_until_ms: 300000` or higher; do not abort during quiet compiles.
+5. **Never pipe** `build.sh` or `run_tests.sh` — no `| tee`, `| tail`, `| head`, `| grep`, or `2>&1 | …` of any kind. The command string must end at the script's last argument. Read `.build_logs/` / `.test_logs/` afterward instead.
+6. **Never truncate live output** to save tokens — if the full terminal buffer is too long, read the log file path from the script's final lines.
+7. **Always** read the log file on failure before attempting fixes (use the **Next steps** the script prints).
+8. **Always** rebuild after compile fixes and wait again until `✓ Build succeeded`.
+9. Use `--scheme` when the app name contains spaces or doesn't match the repo folder.
+10. Use `--verbose` when failure summary is empty, exit code is ambiguous, or you need live progress.
+11. Request `all` sandbox permissions for Xcode tool invocations.
+12. **Do not** background the command just because output pauses after the preflight block — xcodebuild is still running in quiet mode.
+13. If the user reports "Xcode finished in a minute but your terminal hung", assume a piped command — kill it and re-run without a pipe.
 
 ---
 
@@ -325,12 +375,15 @@ ${CLAUDE_SKILL_DIR}/scripts/build.sh --scheme "Exact Scheme Name"
 # or add SCHEME=... to .env
 ```
 
-### "No simulator found"
+### "No simulator found" / DEVICE_ID unset
 
 ```bash
-xcrun simctl list devices available
-# add DEVICE_ID=<udid> to .env
+${HOME}/.claude/skills/sim-pool/scripts/sim-pool status
+eval "$(${HOME}/.claude/skills/sim-pool/scripts/sim-pool acquire --holder-pid $$ --owner "agent-$$" --project "$(basename "$PWD")" --worktree "$PWD" --session "qa-$$")"
+export DEVICE_ID="$UDID"
 ```
+
+Or set `SIM_POOL_SKIP=1` for solo-Mac legacy auto-pick. On `SIM_POOL_BUSY`, report inconclusive — pool and ephemeral limits are exhausted.
 
 ### Build fails on Apple Silicon (old x86 pods / EXCLUDED_ARCHS arm64)
 

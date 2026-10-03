@@ -26,20 +26,24 @@ Treat an empty `session list` as **inconclusive**. Always also check `device sta
 
 ## Multi-agent recipe (preferred)
 
+When parallel agents share one Mac, **lease the UDID first** with the `sim-pool` skill, then use that UDID here.
+
 ```bash
-# 1) Inventory
+# 0) sim-pool lease (host-wide; see sim-pool skill)
+SP="${CLAUDE_SKILL_DIR}/../sim-pool/scripts/sim-pool"
+SESSION="agent-$(whoami)-$$"
+eval "$($SP acquire --holder-pid $$ --owner "$SESSION" --project "$(basename "$PWD")" --worktree "$PWD" --session "$SESSION")"
+export DEVICE_ID="$UDID"
+
+# 1) Inventory (confirm lease UDID is yours)
 ad session list
 ad devices
 ad device status --platform ios
 
-# 2) Choose a FREE target
-#    - Prefer Shutdown simulators (boot them yourself)
-#    - Or booted sims with NO matching claim/session
-#    - Never take a UDID that another agent actively owns unless the user says so
+# 2) Use the leased UDID only — do not pick a different free UDID
 
-# 3) Named session (unique per agent/task)
-SESSION="agent-$(whoami)-$$"
-UDID="<free-udid>"
+# 3) Named session (same name as sim-pool --session)
+UDID="$DEVICE_ID"
 
 ad boot --platform ios --udid "$UDID"   # if not booted
 ad open MyApp \
@@ -54,6 +58,7 @@ ad press @e3 --settle --session "$SESSION"
 
 # 5) Always release when done
 ad close --session "$SESSION"
+$SP release --lease "$LEASE_ID"
 # optional: also shut down the sim you started
 # ad close --session "$SESSION" --shutdown
 ```

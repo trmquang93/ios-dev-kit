@@ -32,6 +32,7 @@ home.mkdir(parents=True, exist_ok=True)
 config = {
     "devices": ["AAAA1111-1111-1111-1111-111111111111", "BBBB2222-2222-2222-2222-222222222222"],
     "defaults": {"timeout_seconds": 600, "ttl_seconds": 900, "poll_seconds": 1, "prefer": "shutdown"},
+    "ephemeral": {"enabled": False, "clones_only": False},
 }
 (home / "config.json").write_text(json.dumps(config, indent=2) + "\n")
 PY
@@ -74,7 +75,7 @@ config["defaults"]["poll_seconds"] = 1
 PY
     out1=$("$SIM_POOL" acquire --holder-pid $$ --owner hold1 --session h1 2>&1)
     lease1=$(echo "$out1" | grep '^LEASE_ID=' | cut -d= -f2-)
-    if "$SIM_POOL" acquire --holder-pid $$ --owner wait --timeout 2 2>/tmp/sim-pool-busy.err; then
+    if "$SIM_POOL" acquire --holder-pid $$ --owner wait --timeout 2 --no-ephemeral 2>/tmp/sim-pool-busy.err; then
         fail "third acquire should timeout"
     else
         code=$?
@@ -214,12 +215,141 @@ test_no_create_in_script() {
     fi
 }
 
+test_ephemeral_when_busy() {
+    setup_pool
+    python3 - "$AGENT_SIM_POOL_HOME" <<'PY'
+import json, sys
+from pathlib import Path
+home = Path(sys.argv[1])
+config = json.loads((home / "config.json").read_text())
+config["devices"] = ["AAAA1111-1111-1111-1111-111111111111"]
+config["ephemeral"] = {"enabled": True, "clones_only": False, "max_devices": 4, "max_concurrent": 4, "delete_on_release": True}
+(home / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+PY
+    out1=$("$SIM_POOL" acquire --holder-pid $$ --owner hold-ephemeral --session e1 2>&1)
+    lease1=$(echo "$out1" | grep '^LEASE_ID=' | cut -d= -f2-)
+    out2=$(SIM_POOL_TEST_PROVISION_UDID="CCCC3333-3333-3333-3333-333333333333" \
+        "$SIM_POOL" acquire --holder-pid $$ --owner ephemeral --session e2 --timeout 10 2>&1)
+    udid2=$(echo "$out2" | grep '^UDID=' | cut -d= -f2-)
+    ephemeral=$(echo "$out2" | grep '^EPHEMERAL=' | cut -d= -f2-)
+    if [ "$udid2" = "CCCC3333-3333-3333-3333-333333333333" ] && [ "$ephemeral" = "true" ]; then
+        pass "ephemeral acquire when busy"
+    else
+        fail "ephemeral acquire when busy (udid=$udid2 ephemeral=$ephemeral)"
+    fi
+    lease2=$(echo "$out2" | grep '^LEASE_ID=' | cut -d= -f2-)
+    "$SIM_POOL" release --lease "$lease2" >/dev/null
+    if [ -f "$AGENT_SIM_POOL_HOME/config.json" ] && grep -q CCCC3333 "$AGENT_SIM_POOL_HOME/config.json"; then
+        fail "ephemeral device still in config after release"
+    else
+        pass "ephemeral deleted on release"
+    fi
+    "$SIM_POOL" release --lease "$lease1" >/dev/null
+    teardown_pool
+}
+
+test_missing_sim_gc() {
+    setup_pool
+    python3 - "$AGENT_SIM_POOL_HOME" <<'PY'
+import json, sys
+from pathlib import Path
+home = Path(sys.argv[1])
+config = json.loads((home / "config.json").read_text())
+ghost = "DEAD0000-0000-0000-0000-000000000001"
+config["ephemeral_devices"] = [{
+    "udid": ghost,
+    "name": "ghost-clone",
+    "clone_source": "AAAA1111-1111-1111-1111-111111111111",
+    "created_at": "2020-01-01T00:00:00+00:00",
+}]
+config["devices"] = ["AAAA1111-1111-1111-1111-111111111111"]
+config["ephemeral"] = {"enabled": False, "clones_only": False}
+(home / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+leases = home / "leases"
+leases.mkdir(parents=True, exist_ok=True)
+(leases / f"{ghost}.json").write_text(json.dumps({
+    "lease_id": "lease-ghost",
+    "udid": ghost,
+    "owner": "gone",
+    "pid": 99999999,
+    "project": "t",
+    "session": "s",
+    "purpose": "qa",
+    "acquired_at": "2026-10-02T10:00:00+00:00",
+    "expires_at": "2026-10-02T10:15:00+00:00",
+    "ephemeral": True,
+}, indent=2) + "\n")
+PY
+    dropped=$("$SIM_POOL" gc 2>&1)
+    if echo "$dropped" | grep -q "missing_sim"; then
+        pass "gc drops lease when simulator missing from simctl"
+    else
+        fail "gc missing_sim (got: $dropped)"
+    fi
+    if [ -f "$AGENT_SIM_POOL_HOME/leases/DEAD0000-0000-0000-0000-000000000001.json" ]; then
+        fail "ghost lease file still present"
+    else
+        pass "ghost lease file removed"
+    fi
+    teardown_pool
+}
+
+test_live_clone_survives_gc() {
+    setup_pool
+    fake_bin="$(mktemp -d)"
+    clone="C10E0000-0000-0000-0000-000000000001"
+    cat > "$fake_bin/xcrun" <<EOF
+#!/bin/bash
+echo '{"devices":{"com.apple.CoreSimulator.SimRuntime.iOS-27-0":[{"udid":"$clone","name":"sim-pool-ephemeral-abcd1234","state":"Booted","isAvailable":true}]}}'
+EOF
+    chmod +x "$fake_bin/xcrun"
+    python3 - "$AGENT_SIM_POOL_HOME" "$clone" "$$" <<'PY'
+import json, sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+home, clone, pid = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+config = json.loads((home / "config.json").read_text())
+now = datetime.now(timezone.utc).replace(microsecond=0)
+config["ephemeral_devices"] = [{
+    "udid": clone,
+    "name": "sim-pool-ephemeral-abcd1234",
+    "clone_source": "AAAA1111-1111-1111-1111-111111111111",
+    "created_at": now.isoformat(),
+}]
+config["ephemeral"] = {"enabled": False, "clones_only": True}
+(home / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+(home / "leases" / f"{clone}.json").write_text(json.dumps({
+    "lease_id": "lease-clone",
+    "udid": clone,
+    "owner": "live",
+    "pid": pid,
+    "project": "t",
+    "session": "s",
+    "purpose": "qa",
+    "acquired_at": now.isoformat(),
+    "expires_at": (now + timedelta(minutes=10)).isoformat(),
+    "ephemeral": True,
+}, indent=2) + "\n")
+PY
+    PATH="$fake_bin:$PATH" "$SIM_POOL" gc >/dev/null 2>&1
+    if [ -f "$AGENT_SIM_POOL_HOME/leases/$clone.json" ] && grep -q "$clone" "$AGENT_SIM_POOL_HOME/config.json"; then
+        pass "live lease on sim-pool-ephemeral-* clone survives gc (clone is reused, not re-cloned)"
+    else
+        fail "gc dropped lease/registry for clone named sim-pool-ephemeral-* (missing_sim false positive)"
+    fi
+    rm -rf "$fake_bin"
+    teardown_pool
+}
+
 test_acquire_and_release
+test_missing_sim_gc
+test_live_clone_survives_gc
 test_busy_timeout
 test_dead_pid_gc
 test_ttl_reclaim
 test_parallel_acquire
 test_no_create_in_script
+test_ephemeral_when_busy
 
 echo ""
 echo "Tests passed: $TESTS_PASSED"
